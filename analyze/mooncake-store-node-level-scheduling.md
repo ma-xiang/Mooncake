@@ -46,7 +46,7 @@
 ```mermaid
 flowchart LR
     A[Client 读取远端 Memory 副本] --> B[记录成功传输样本]
-    B --> C[按 target_segment 统计归一化 P50/P99]
+    B --> C[按 target_segment_id 统计归一化 P50/P99]
     C --> D{时延同步方式}
     D -->|方案一| E[周期 ReportNodeLoad RPC]
     D -->|方案二| F[PutEnd 请求捎带]
@@ -84,15 +84,15 @@ $$
 
 当前 [`MemoryDescriptor`](../mooncake-store/include/replica.h#L343-L346) 只有 Buffer 和 locality，没有可靠的 Segment/节点身份。`transport_endpoint_` 可能是 hostname，也可能是 P2P `ip:port`，不应通过解析 endpoint 猜测节点。
 
-建议在 `MemoryDescriptor` 尾部增加兼容字段 `target_segment`，由 Master 在 [`Replica::get_descriptor()`](../mooncake-store/include/replica.h#L934-L950) 中通过 `AllocatedBuffer::getSegmentName()` 填充：
+建议在 `MemoryDescriptor` 尾部增加兼容字段 `target_segment_id`，由 Master 在 [`Replica::get_descriptor()`](../mooncake-store/include/replica.h#L934-L950) 中根据副本所属 Allocator 的挂载注册信息填充：
 
 ```cpp
-struct_pack::compatible<std::string, 2> target_segment;
+struct_pack::compatible<UUID, 2> target_segment_id;
 ```
 
-Client 按 `target_segment` 统计；Master 再根据 [`Segment`](../mooncake-store/include/types.h#L505-L519) 的挂载信息映射为 `host_id`。`host_id` 为空时退化为 `Segment.name`。旧 Master 不返回该字段时，新 Client 跳过对应样本。
+Client 按 `target_segment_id` 统计；Master 通过当前挂载表将 [`Segment.id`](../mooncake-store/include/types.h#L505-L519) 映射为 `host_id`，`host_id` 为空时退化为 `Segment.name`。旧 Master 不返回该字段时，新 Client 跳过对应样本；Master 收到未知或已卸载 Segment ID 的报告时直接丢弃。
 
-为支持缩容后同名节点重入，建议 Master 在每次 `MountSegment` 成功时生成新的 `mount_epoch`，并在副本描述和时延上报中携带。调度实例身份为 `(target_segment, mount_epoch)`，`host_id` 只作为节点聚合键，不能作为实例唯一标识。Master 拒绝 mount epoch 与当前挂载实例不匹配的旧报告。
+**不新增 `mount_epoch`。** 新挂载已经由 [`Client::MountSegmentAndGetId()`](../mooncake-store/src/client_service.cpp#L3972-L4038) 生成新的 Segment UUID，而 [`ReMountSegment()`](../mooncake-store/src/segment.cpp#L322-L378) 会保留并校验原 ID。因此现有 `Segment.id` 就是统计实例身份：全新挂载自然隔离旧统计，ReMount 则保持同一逻辑 Segment 的身份。
 
 ### 2.3 上报数据模型
 
@@ -101,14 +101,13 @@ Client 按 `target_segment` 统计；Master 再根据 [`Segment`](../mooncake-st
 | 字段 | 含义 |
 | --- | --- |
 | `report_seq` | Client 单调递增的报告批次号，用于诊断和批次去重 |
-| `target_segment` | 被读取副本所属 Segment |
-| `mount_epoch` | Master 为每次挂载生成的实例纪元，隔离缩容重入前后的统计 |
+| `target_segment_id` | 被读取副本所属 Segment 的现有 UUID |
 | `sample_version` | 每个 Client/目标单调递增的统计版本，用于防止旧报告覆盖新报告 |
 | `p50_us` / `p99_us` | 归一化读时延分位数，建议使用 64 位整数 |
 | `sample_count` | 当前统计窗口的有效样本数 |
 | `window_end_age_ms` | 发送时统计窗口结束点距当前的毫秒数 |
 
-Master 按 `(client_id, target_segment, mount_epoch)` 检查 `sample_version`，而不是仅靠整个 RPC 的批次号拒绝旧报文。这样即使周期上报和 PutEnd 上报并发、携带的目标集合不同，也不会误丢弃较新的其他目标统计。
+Master 按 `(client_id, target_segment_id)` 检查 `sample_version`，而不是仅靠整个 RPC 的批次号拒绝旧报文。这样即使周期上报和 PutEnd 上报并发、携带的目标集合不同，也不会误丢弃较新的其他目标统计。
 
 Master 使用本地单调接收时间和 `window_end_age_ms` 判断测量新鲜度，不依赖 Client 与 Master 的墙钟同步。空报告不刷新测量时间。
 
@@ -116,7 +115,7 @@ Master 使用本地单调接收时间和 `window_end_age_ms` 判断测量新鲜�
 
 Master 保存两层状态：
 
-1. `(client_id, target_segment, mount_epoch)` 的最新 Reporter 记录；
+1. `(client_id, target_segment_id)` 的最新 Reporter 记录；
 2. 每个节点的只读调度快照。
 
 RPC 处理只更新第一层。Master 约每秒聚合一次：
@@ -174,7 +173,7 @@ sequenceDiagram
     participant M as Master
 
     TE->>S: 远端 Memory 读成功
-    Note right of TE: future->get() 返回成功<br/>记录耗时、字节数和 target_segment
+    Note right of TE: future->get() 返回成功<br/>记录耗时、字节数和 target_segment_id
     S->>S: 大小归一化并写入当前窗口
     Note over S,U: 此时尚未向 Master 发送 RPC
 
@@ -182,7 +181,7 @@ sequenceDiagram
     U->>S: 关闭当前窗口并取得新样本
 
     alt 窗口内有新样本
-        S-->>U: 返回各 target_segment 的样本集合
+        S-->>U: 返回各 target_segment_id 的样本集合
         U->>U: 计算 P50/P99、样本数和统计版本
         U->>M: ReportNodeLoad(client_id, report_seq, items)
         alt 上报成功
@@ -260,7 +259,7 @@ sequenceDiagram
     participant M as Master
 
     C->>S: 多次远端 Memory 读成功
-    S->>S: 记录并归一化样本<br/>按 target_segment 聚合
+    S->>S: 记录并归一化样本<br/>按 target_segment_id 聚合
 
     C->>M: PutStart
     M-->>C: 返回本次写入副本描述
@@ -341,7 +340,7 @@ PutEnd 捎带的内容仍然是此前已经统计好的**读时延摘要**，不
 - 写入活跃时，优先随 PutEnd 捎带，减少额外 RPC；
 - 摘要等待超过 3 秒仍未发送时，通过独立 `ReportNodeLoad` 补报；
 - 纯读 Client 完全由周期通道上报；
-- 两个通道使用相同的 `(client_id, target_segment, mount_epoch, sample_version)` 防乱序语义；
+- 两个通道使用相同的 `(client_id, target_segment_id, sample_version)` 防乱序语义；
 - 没有新样本时不上报，也不通过空 PutEnd 或空周期报告续期；
 - Master 重启后统计数据丢失，冷启动回退原分配策略，不写 WAL/ETCD。
 
@@ -403,50 +402,61 @@ flowchart TD
 
 必须先按节点分组、再选 Segment，否则同一节点 Segment 越多，其被带权抽中的总概率越高。无统计节点不参与正常带权选择，但允许通过限量探索获得写入，避免“没有统计 → 永远不被写入 → 永远没有统计”的死锁。
 
-## 8. 节点扩缩容
+## 8. 适配现有扩缩容方案
 
-扩缩容改变的是**后续新副本的分配范围**，不等同于自动迁移存量数据。节点调度状态与 `ReplicaStatus` 分离，不能因为缩容或统计过期就直接删除、完成或失败一个副本。
+调度方案不新建扩缩容控制面，而是复用现有 `MountSegment`、`SegmentStatus`、Allocator serving、Drain Job、Move 和 Unmount。时延统计只决定“在现有可分配候选中如何选择”，不能反向改变 Segment 状态或 `ReplicaStatus`。
 
-### 8.1 节点生命周期
+### 8.1 现有机制与调度接入关系
 
-建议 Master 为调度维护以下节点视图；它是设计新增状态，不是当前代码已有状态机：
+| 现有机制 | 代码已有行为 | 时延调度需要做的适配 |
+| --- | --- | --- |
+| `MountSegment` | 创建 Allocator、登记 `OK` 状态和 host 索引后加入候选；新挂载使用新 UUID | 以新 `Segment.id` 建立 Reporter 来源；所属节点无有效统计时按 WARMING_UP 处理 |
+| `SetSegmentStatusByName(DRAINING)` | 从 AllocatorManager 移除注册并 `SetAllocatable(false)`，已有副本保持原位且可读，见 [`SetSegmentStatusByName()`](../mooncake-store/src/segment.cpp#L789-L829) | 只从 serving Allocator 快照构建候选，不得从全量挂载表重新加入首选节点 |
+| `CreateDrainJob` | 将请求中的 Segment 置为 `DRAINING`，通过现有 Move 任务迁移，见 [`CreateDrainJob()`](../mooncake-store/src/master_service.cpp#L10714-L10751) | 直接复用，不再设计独立副本迁移状态机 |
+| `DRAINED` | Drain Job 确认源 Segment 没有剩余单元后设置该状态，但不自动 Unmount | 继续保持不可分配，是否卸载由现有运维流程决定 |
+| `GRACEFULLY_UNMOUNTING` | 停止新分配但不 Invalidate 已分配 Buffer，见 [`PrepareGracefulUnmountSegment()`](../mooncake-store/src/segment.cpp#L479-L518) | 不参与新评分；在途写按原协议收尾 |
+| `UNMOUNTING` | 立即卸载会 Invalidate Allocator 和既有 Buffer，见 [`PrepareUnmountSegment()`](../mooncake-store/src/segment.cpp#L436-L476) | 清理该 `Segment.id` 的统计，未知 ID 的旧报告直接丢弃 |
+| Client liveness | 非 serving 和 OFFLINE 由现有监控、副本可用性及 offboarding 处理 | 立即退出候选，不等待时延 TTL，也不新增 OFFLINE 状态 |
 
-| 状态 | 进入条件 | 新副本分配 | 时延统计处理 |
-| --- | --- | --- | --- |
-| `WARMING_UP` | 新节点首次挂载，尚无足够样本 | 只允许首选自然流量和限量探索 | 接收新 mount epoch 的样本，不视为故障 |
-| `NORMAL` | 新鲜样本达到最低置信度 | 参与正常节点带权选择 | 正常聚合和 EWMA |
-| `STALE` | 曾经有统计，但样本已过期 | 退出正常带权选择，保留限量探索 | 等待新样本，不用空报告续期 |
-| `DRAINING` | 运维显式发起缩容 | 禁止所有新分配，覆盖首选亲和 | 可为观测保留，但不再用于写入评分 |
-| `OFFLINE` | Segment 已卸载或节点按现有可用性规则下线 | 禁止分配 | 清理实例统计，旧 epoch 报告无效 |
+`WARMING_UP/NORMAL/STALE` 只是 Master 根据统计派生的视图，**不写入现有 `SegmentStatus`，不需要持久化**：
+
+- `WARMING_UP`：节点下有 serving Segment，但节点新鲜样本不足，只允许首选自然流量或限量探索；
+- `NORMAL`：节点下有 serving Segment 且统计新鲜、达到置信度，参与正常带权选择；
+- `STALE`：节点下有 serving Segment 但统计已过期，退出正常带权选择，保留有限探索；
+- 一旦现有状态变为非 `OK` 或 registration 非 serving，上述统计视图均不能使其重新进入候选。
 
 ```mermaid
-flowchart LR
-    A[未挂载] -->|MountSegment 分配新 epoch| B[WARMING_UP]
-    B -->|新鲜样本达到置信度| C[NORMAL]
-    C -->|测量数据过期| D[STALE]
-    D -->|收到新有效样本| C
-    B -->|开始缩容| E[DRAINING]
-    C -->|开始缩容| E
-    D -->|开始缩容| E
-    E -->|满足退出条件并 Unmount| F[OFFLINE]
-    B -->|异常掉线或 Unmount| F
-    C -->|异常掉线或 Unmount| F
-    D -->|异常掉线或 Unmount| F
-    F -->|重新 MountSegment 使用新 epoch| B
+flowchart TD
+    A[MountSegment 创建 Allocator] --> B[现有 SegmentStatus OK<br/>进入 serving 候选]
+    B --> C{所属节点的派生统计视图}
+    C -->|样本不足| D[WARMING_UP<br/>首选自然流量或限量探索]
+    C -->|新鲜且达到置信度| E[NORMAL<br/>参与带权选择]
+    E -->|统计过期| F[STALE<br/>退出正常带权]
+    F -->|收到新样本| E
+
+    B -->|SetSegmentStatus 或 CreateDrainJob| G[现有 DRAINING<br/>停止新分配]
+    D -->|Segment 开始 Drain| G
+    E -->|Segment 开始 Drain| G
+    F -->|Segment 开始 Drain| G
+    G -->|取消或按任务结果恢复| B
+    G -->|DrainJob 成功| H[现有 DRAINED<br/>不自动 Unmount]
+    G -->|Graceful Unmount| I[GRACEFULLY_UNMOUNTING]
+    H -->|后续执行 Unmount| J[UNMOUNTING<br/>清理 Segment.id 统计]
+    I -->|最终 Unmount| J
 ```
 
-节点是否可分配首先由现有 serving、Allocator、Client liveness 和排除规则决定。`WARMING_UP/NORMAL/STALE` 只影响时延策略的选择方式，不能覆盖这些硬约束。
+新策略必须继续调用现有 registration 的 `Allocate()`，并复用 [`getServingNames()`](../mooncake-store/include/allocation_strategy.h#L168-L181) 和 [`allocateSingle()`](../mooncake-store/include/allocation_strategy.h#L431-L468) 的 serving 语义。当前 [`AllocateReplicas()`](../mooncake-store/src/master_service.cpp#L4863-L4865) 没有额外传入 excluded 集合，因此不能靠新增排除列表代替 DRAINING 的现有过滤。
 
-### 8.2 扩容：冷启动与渐进接入
+### 8.2 扩容：复用 MountSegment 冷启动
 
-扩容流程如下：
+现有动态扩容可通过 [`RealClient::allocateAndMountSegment`](../mooncake-store/src/real_client.cpp#L2417-L2502) 完成内存准备和挂载。时延调度只增加以下统计和候选逻辑：
 
-1. 新节点挂载一个或多个 Segment，Master 为每次挂载生成新的 `mount_epoch`，节点进入 `WARMING_UP`。
-2. Master 将同一 `host_id` 下的 Segment 归为一个节点，避免 Segment 数量放大节点权重。
-3. 新节点没有历史时延，不参与正常带权选择，但可以通过**限量探索**接收新副本；如果它本来就是请求首选节点，可沿用首选自然流量，无需重复增加探索流量。
-4. 探索必须有独立预算，例如限制非首选分配比例或新写入字节比例，且仍受 serving、容量、excluded 和 used 约束。防饥饿不能无限放大探索流量。
-5. 新副本完成 `PutEnd` 并对 Reader 可见后，其他 Client 的读取逐渐形成时延上报；统计达到置信度后，节点进入 `NORMAL`。
-6. 如果 P99 超过门限，节点继续限流，不因为“刚扩容”而绕过质量门限；如果长期没有样本，则保持 `WARMING_UP` 或转为 `STALE`，而不是判定节点故障。
+1. 新 Segment 按现有流程生成 UUID、创建 Allocator 并进入 serving，不新增或修改挂载状态。
+2. 报告和清理按 `Segment.id`，统计视图和节点选择按 `host_id`。已有 NORMAL 节点新增 Segment 时可沿用节点统计；全新节点没有有效统计时进入 WARMING_UP，且 Segment 数量不能放大节点权重。
+3. WARMING_UP 节点不参与正常带权选择，但其 Segment 可以从**现有 serving 候选**中接受限量探索；如果是请求首选 Segment，可沿用首选自然流量。
+4. 探索预算限制非首选分配比例或写入字节比例，并继续满足 registration serving、容量、used 和 HCA affinity 等现有约束。
+5. 新副本通过原 `PutEnd` 成为 COMPLETE 后，Reader 按现有读路径产生样本；统计新鲜且达到置信度后转为 NORMAL。
+6. P99 超门限继续限流；长期无样本只表示统计未知，不改变现有 SegmentStatus，也不判定节点故障。
 
 ```mermaid
 sequenceDiagram
@@ -459,69 +469,81 @@ sequenceDiagram
 
     O->>N: 启动节点并准备 Segment
     N->>M: MountSegment
-    M->>M: 生成 mount_epoch<br/>标记 WARMING_UP
+    M->>M: 使用已有 Segment.id<br/>创建 Allocator 并设为 OK/serving
+    M->>M: 所属节点无有效统计时<br/>派生为 WARMING_UP
 
-    loop 限量探索或首选自然流量
+    loop 从 serving 候选中限量探索或首选分配
         W->>M: PutStart
-        M-->>W: 返回新节点副本描述
+        M-->>W: 返回新 Segment 的副本描述
         W->>N: TransferWrite
         W->>M: PutEnd
         M->>M: 副本按原协议转为 COMPLETE
     end
 
     R->>M: GetReplicaList
-    M-->>R: 返回包含新节点的可读副本
+    M-->>R: 返回包含新 Segment 的可读副本
     R->>N: TransferRead
-    R->>M: 上报 segment、mount_epoch 和读时延
+    R->>M: 上报 target_segment_id 和读时延
     M->>M: 聚合新鲜样本并检查置信度
-    M->>M: 达到条件后转为 NORMAL
+    M->>M: 达到条件后将统计视图改为 NORMAL
 ```
 
-扩容不自动搬移旧对象，也不立即追求全集群容量均衡。若需要存量副本重均衡，应由独立任务限流执行，复用正常写入、提交和读校验流程。
+扩容本身不触发通用自动 rebalance。若需要补充或移动存量副本，应显式使用现有 Copy/Move 任务；第一阶段不必修改其目标选择算法。
 
-### 8.3 缩容：停止新分配与数据安全退出
+### 8.3 缩容：复用 DRAINING 与 Drain Job
 
-建议增加显式管理操作 `MarkNodeDraining(host_id)`。缩容不能只靠“停止上报时延”或等待统计过期实现：
+不新增 `MarkNodeDraining`。当前管理单元是 Segment，节点级缩容由运维将同一 `host_id` 下需要退出的全部 `Segment.name` 放入同一个 `CreateDrainJobRequest.segments`：
 
-1. 将节点标记为 `DRAINING`，立即从**所有新 PutStart**候选中排除；该过滤应位于公共分配入口，对 READ_LATENCY_AWARE 和原分配策略都生效。
-2. 缩容覆盖首选亲和，避免 Client 继续通过 `preferred_segments` 向节点写入新副本。
-3. 已经进入分配或传输阶段的操作允许按原协议执行 `PutEnd`，不能因节点开始缩容而把在途提交直接改成失败。
-4. 节点仍可用时，已有 `COMPLETE` 副本继续按原读路径提供读取；缩容本身不修改 `ReplicaStatus`。
-5. 对需要保留的唯一副本先执行独立重建或迁移，确认其他节点已有满足可靠性要求的可读副本后，才能卸载 Segment。
-6. 在途写完成后按现有协议 Unmount 并下线；超过既有租约或清理周期仍未完成的 `PROCESSING` 副本交给原有失败清理逻辑，不能无限等待。
-7. 清理该 mount epoch 的 Reporter、Segment 映射和节点快照。之后到达的旧报告直接拒绝，不能让已下线节点“因时延上报复活”。
+1. 现有 `CreateDrainJob()` 将本批 Segment 设置为 `DRAINING`；设置失败时回滚本批次已经修改的项。只需临时停止分配而不迁移时，使用现有 `PUT /api/v1/segments/status`。
+2. `DRAINING` 已经从 AllocatorManager 移除 registration，因此 READ_LATENCY_AWARE 和原策略都必须从同一 serving 快照取候选，首选 Segment 也不能重新加回。
+3. 存量副本迁移直接交给现有 Drain Job 和 Move 任务。现有 pin、有效 lease、非全 COMPLETE、已有复制任务等阻塞条件保持不变。
+4. 第一阶段继续沿用 [`SelectDrainTargetForKey()`](../mooncake-store/src/master_service.cpp#L10837-L10873) 的目标选择；后续若引入时延评分，也只能在现有目标约束之后作为二级排序，不能削弱迁移可靠性条件。
+5. Drain Job 成功后 Segment 进入 `DRAINED`，但**不会自动 Unmount**。是否继续优雅卸载或立即卸载由现有运维流程决定。
+6. Segment 卸载后清理对应 `Segment.id` 的 Reporter 和映射；其他 Client 后续发送的旧 ID 报告无法重新建立节点候选。
 
 ```mermaid
 flowchart TD
-    A[运维发起节点缩容] --> B[标记 DRAINING]
-    B --> C[公共分配入口禁止新 PutStart 选择该节点]
-    C --> D[首选亲和和探索也不再绕过排除]
-    D --> E{在途写结束且必要副本重建完成}
-    E -- 否 --> F[允许既有 PutEnd 完成<br/>唯一副本先执行独立重建]
-    F --> E
-    E -- 是 --> G[按现有协议 Unmount 并下线]
-    G --> H[清理 mount epoch 对应的统计和映射]
-    H --> I[标记 OFFLINE]
-    B -.-> J[节点仍可用时<br/>已有 COMPLETE 副本继续可读]
+    A[收集待退出节点的全部 Segment.name] --> B[CreateDrainJobRequest.segments]
+    B --> C[现有 CreateDrainJob 设置 DRAINING]
+    C --> D[AllocatorManager 移除 registration<br/>所有分配策略共享 serving 过滤]
+    D --> E[现有 Drain Job 通过 Move 迁移副本]
+    E --> F{Drain Job 结果}
+    F -- 成功 --> G[SegmentStatus DRAINED<br/>不自动 Unmount]
+    F -- 失败或取消 --> H[按现有任务逻辑恢复或处理状态]
+    G --> I[运维按需执行现有 Unmount]
+    I --> J[清理 Segment.id 统计<br/>拒绝迟到的旧 ID 报告]
+    C -.-> K[已有 COMPLETE 副本在仍 available 时继续可读]
 ```
 
-异常宕机或强制缩容不等待 10 秒统计 TTL，而是立即使用现有 Client liveness、Segment serving 和 Allocator 可用性规则停止分配并排除不可读副本。**时延新鲜度不是节点存活判断，缩容状态也不能替代副本可靠性检查。**
+### 8.4 在途写、立即卸载与异常下线
 
-### 8.4 缩容重入与多 Segment 一致性
+不同现有操作对在途写和可读性的影响不同，不能统一描述为“缩容后 PutEnd 一定成功”：
 
-- 同名节点或相同 `host_id` 重新加入时必须使用新的 `mount_epoch`，从 `WARMING_UP` 重新开始，不能继承旧 P50/P99。
-- 节点级 `DRAINING` 应原子作用于其全部 Segment，防止一个 Segment 停止分配后，流量被转移到同节点另一个 Segment。
-- 节点最后一个 Segment 卸载后才删除节点级快照；仍有有效 Segment 时，只清理对应实例统计。
-- Master 重启后性能统计丢失，但挂载元数据按既有机制恢复；调度先回退原策略，再通过新样本重建节点视图。
+| 现有操作 | 新分配 | 已分配 Buffer/副本 | 调度方案处理 |
+| --- | --- | --- | --- |
+| `DRAINING` / `DRAINED` | 停止 | 不失效，已有 COMPLETE 副本仍按原规则可读 | 立即退出候选，在途写按原 PutEnd/PutRevoke 协议完成 |
+| `GRACEFULLY_UNMOUNTING` | 停止 | 不 Invalidate 已分配 Buffer | 不新增分配，允许原流程收尾 |
+| 立即 `UNMOUNTING` | 停止 | Invalidate Allocator 和 Buffer，既有内存副本不可用 | 清理统计；PutEnd 只提交仍有效的目标副本，不作成功保证 |
+| Client 非 serving/OFFLINE | 按现有 liveness 停止 | 走现有 offboarding、PROCESSING 等待和过期清理 | 不等待时延 TTL，统计不参与存活判断 |
+
+异常宕机或强制缩容同样不等待 10 秒统计 TTL。**时延新鲜度只用于性能评分，Segment serving、Client liveness 和 Allocator 有效性才决定分配与副本可用性。**
+
+### 8.5 重挂载、HA 与多 Segment 一致性
+
+- 全新 Mount 使用新 UUID 并隔离该 Segment 的旧报告；所属节点没有其他有效统计时从 WARMING_UP 开始。ReMount 保留原 Segment ID，不增加额外纪元字段。Master 重启后性能统计丢失，等待新样本即可。
+- ReMount 前的 `awaiting_remount` 仍按现有逻辑屏蔽读取，时延报告不能使副本提前可读。
+- 节点级缩容应把待退出的全部 Segment 放入同一个 Drain 请求，避免只停一个 Segment 后，新流量转到同节点另一个 Segment。
+- 聚合时只使用仍存在且身份匹配的 Segment ID；节点最后一个相关 Segment 清理后，节点级统计自然消失。
+- 现有 HTTP 文档说明 Segment 状态切换不保证写入 HA oplog，见 [`http-service.md`](../docs/source/api-reference/http/http-service.md#L487-L521)。Master 故障切换后，运维必须查询并核对 Drain Job/Segment 状态，必要时重发 DRAINING；时延调度不能假设该状态一定持久。
 
 ## 9. 可观测性与验收重点
 
 建议增加以下指标：
 
 - Client：有效样本数、窗口刷新次数、待上报摘要年龄、两种通道的上报成功/失败次数；
-- Master：新鲜 Reporter 数、节点 P50/P99、低置信度节点数、过期记录数、旧版本及旧 mount epoch 报告拒绝数；
+- Master：新鲜 Reporter 数、节点 P50/P99、低置信度节点数、过期记录数、旧版本及未知 Segment ID 报告拒绝数；
 - 调度：带权选择、防饥饿、探索、原策略回退和 Segment 分配失败次数；
-- 扩缩容：各生命周期节点数、探索分配量、节点转为 NORMAL 的耗时、DRAINING 停留时间、在途写完成数及缩容期间误分配次数；
+- 扩缩容：各统计视图节点数、探索分配量、节点转为 NORMAL 的耗时、现有 Drain Job 状态、DRAINING 停留时间及缩容期间误分配次数；
 - PutEnd：附带摘要的请求数、摘要条目数、序列化耗时和非法摘要数。
 
 重点验证：
@@ -532,18 +554,19 @@ flowchart TD
 4. PutEnd 和周期报告乱序到达时，旧 `sample_version` 不覆盖新值；
 5. PutEnd 中统计非法或处理失败不影响副本提交；
 6. Master 重启、Client 重启和 Segment unmount 后能够回退或清理状态；
-7. 新节点通过限量探索形成统计并进入 NORMAL，且不会被 Segment 数量放大权重；
-8. 新节点无统计时不被判为故障，P99 超门限时也不能借探索绕过质量约束；
-9. DRAINING 节点在所有分配策略下都没有新分配，首选节点也不能绕过，而在途 PutEnd 和既有可读副本行为正确；
-10. 缩容不自动删除唯一副本，强制下线不等待统计 TTL；
-11. 同名节点重入使用新 mount epoch，旧报告不能复活节点或污染新实例统计；
-12. 新旧 Client/Master 混合部署时协议行为符合预期；
-13. 批量 PutEnd 只上报一次，批量 scatter 不错误归因传输耗时；
-14. 对比开关前后的业务读 P50/P99、写提交时延、Master CPU 和 RPC 流量。
+7. 新 Mount 的 Segment 通过限量探索形成统计并进入 NORMAL，且不会被 Segment 数量放大节点权重；
+8. DRAINING Segment 在所有分配策略下都没有新分配，首选 Segment 也不能从全量挂载表重新加入；
+9. 现有 Drain Job 的 Move、阻塞条件、DRAINED 和不自动 Unmount 语义保持不变；
+10. 分别在 DRAINING、Graceful Unmount 和立即 Unmount 下验证在途 PutEnd，不错误承诺所有路径都成功；
+11. 新 Mount 使用新 UUID、ReMount 保留 UUID，未知或已卸载 Segment ID 的旧报告被拒绝；
+12. 强制下线不等待统计 TTL，Master 故障切换后按现有 HA 语义重新核对 Drain/Segment 状态；
+13. 新旧 Client/Master 混合部署时协议行为符合预期；
+14. 批量 PutEnd 只上报一次，批量 scatter 不错误归因传输耗时；
+15. 对比开关前后的业务读 P50/P99、写提交时延、Master CPU 和 RPC 流量。
 
 ## 10. 结论
 
 - **周期独立上报**解决纯读和低写入场景的反馈连续性，但需要新增 RPC 和生命周期管理。
 - **PutEnd 捎带上报**复用现有链路，适合写入持续活跃的场景，但单独使用不能保证反馈时效。
 - 对需要持续读负载反馈的 Mooncake 节点级调度，推荐采用**PutEnd 主通道 + 超时周期补报**，并统一统计版本、样本年龄、过期和回退语义。
-- 扩容通过限量探索解决冷启动，缩容通过 DRAINING 停止新分配、允许在途提交并独立保障副本安全；mount epoch 用于隔离节点重入前后的统计。
+- 扩缩容优先复用现有 MountSegment、Segment UUID、serving Allocator、DRAINING、Drain Job 和 Unmount；WARMING_UP/NORMAL/STALE 仅是派生统计视图，不新增 mount epoch、MarkNodeDraining 或独立迁移流程。
